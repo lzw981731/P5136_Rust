@@ -1,5 +1,6 @@
 //! Cross-platform P5136 server runtime.
 
+mod accounts;
 mod client_catalog;
 mod config;
 mod equipment_persistence;

@@ -142,6 +142,9 @@ pub enum ServerError {
     #[error("failed to initialize the profile store")]
     ProfileBootstrap(#[source] ProfileStoreError),
 
+    #[error("failed to open the launcher account store")]
+    Accounts(#[source] crate::accounts::AccountError),
+
     #[error(transparent)]
     ProfileIoShutdown(#[from] ProfileIoShutdownError),
 
@@ -339,6 +342,8 @@ pub struct BoundServer {
     emblems: Option<Arc<EmblemCatalog>>,
     item_probabilities: Arc<ItemProbabilityConfiguration>,
     profiles: ProfileIoBootstrap,
+    accounts: crate::accounts::AccountStore,
+    tickets: crate::accounts::TicketStore,
     game_udp: UdpSocket,
     login_tcp: TcpListener,
     p2p_udp: UdpSocket,
@@ -421,6 +426,11 @@ impl BoundServer {
         .await
         .map_err(ServerError::ProfileBootstrapTask)?
         .map_err(ServerError::ProfileBootstrap)?;
+        let accounts =
+            crate::accounts::AccountStore::open(&config.profile_root).await.map_err(ServerError::Accounts)?;
+        let tickets = crate::accounts::TicketStore::new().with_legacy_creation(
+            config.allow_remote_profile_creation && !config.require_account_login,
+        );
 
         Ok(Self {
             config,
@@ -428,6 +438,8 @@ impl BoundServer {
             emblems,
             item_probabilities,
             profiles,
+            accounts,
+            tickets,
             game_udp,
             login_tcp,
             p2p_udp,
@@ -474,6 +486,8 @@ impl BoundServer {
             emblems,
             item_probabilities,
             profiles,
+            accounts,
+            tickets,
             game_udp,
             login_tcp,
             p2p_udp,
@@ -556,6 +570,8 @@ impl BoundServer {
                     emblems,
                     profile_io,
                     profile_runtime,
+                    accounts,
+                    tickets,
                     login_tcp,
                     messenger_tcp,
                     xun_sidecar_tcp,
@@ -1058,6 +1074,7 @@ struct LoginSessionRuntime {
     config: ServerConfig,
     world: WorldHandle,
     profiles: ProfileCoordinator,
+    tickets: crate::accounts::TicketStore,
     wire_operations: WireOperationGate,
 }
 
@@ -1077,6 +1094,7 @@ fn spawn_login_session(
             runtime.config,
             runtime.world,
             runtime.profiles,
+            runtime.tickets,
             runtime.wire_operations,
         )
         .await
@@ -1670,6 +1688,8 @@ struct SupervisorTransports {
     emblems: Option<Arc<EmblemCatalog>>,
     profile_io: ProfileIoHandle,
     profile_runtime: ProfileIoRuntime,
+    accounts: crate::accounts::AccountStore,
+    tickets: crate::accounts::TicketStore,
     login_tcp: TcpListener,
     messenger_tcp: TcpListener,
     xun_sidecar_tcp: TcpListener,
@@ -2367,6 +2387,8 @@ async fn run_supervisor(
         emblems,
         profile_io,
         mut profile_runtime,
+        accounts,
+        tickets,
         login_tcp,
         messenger_tcp,
         xun_sidecar_tcp,
@@ -2379,7 +2401,11 @@ async fn run_supervisor(
         profile_io.clone(),
         reward_persistence_worker_limit(config.max_login_sessions),
     );
-    let xun_sidecar = XunSidecarHandle::new(data_raw_manifest);
+    let xun_sidecar = XunSidecarHandle::new(data_raw_manifest).with_accounts(
+        accounts,
+        tickets.clone(),
+        config.allow_registration,
+    );
     let profiles =
         ProfileCoordinator::new_with_emblems(profile_io, catalog, emblems, xun_sidecar.clone());
     let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
@@ -2390,6 +2416,7 @@ async fn run_supervisor(
         config: config.clone(),
         world: world.clone(),
         profiles: profiles.clone(),
+        tickets: tickets.clone(),
         wire_operations: wire_operations.clone(),
     };
     let mut world_state = RuntimeTaskState::Running;
@@ -2815,6 +2842,8 @@ mod tests {
                 emblems: None,
                 profile_io,
                 profile_runtime,
+                accounts: test_accounts().await,
+                tickets: test_tickets_runtime(),
                 login_tcp,
                 messenger_tcp,
                 xun_sidecar_tcp,
@@ -3788,6 +3817,10 @@ mod tests {
             emblems: None,
             item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
+
+            accounts: test_accounts().await,
+
+            tickets: test_tickets_runtime(),
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
@@ -4114,6 +4147,10 @@ mod tests {
             emblems: None,
             item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
+
+            accounts: test_accounts().await,
+
+            tickets: test_tickets_runtime(),
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
@@ -4554,6 +4591,10 @@ mod tests {
             emblems: None,
             item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
+
+            accounts: test_accounts().await,
+
+            tickets: test_tickets_runtime(),
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
@@ -4865,6 +4906,10 @@ mod tests {
             emblems: None,
             item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
+
+            accounts: test_accounts().await,
+
+            tickets: test_tickets_runtime(),
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
@@ -4880,6 +4925,21 @@ mod tests {
             ProfileIoLimits::for_tests(config.max_login_sessions, config.max_login_sessions);
         ProfileIoBootstrap::acquire(config.profile_root.clone(), limits)
             .expect("test server should acquire its isolated profile-store lease")
+    }
+
+    async fn test_accounts() -> crate::accounts::AccountStore {
+        // Use a throwaway directory; account persistence is not exercised by
+        // transport/actor tests.
+        crate::accounts::AccountStore::open(&std::env::temp_dir().join(format!(
+            "p5136-test-accounts-{}",
+            std::process::id()
+        )))
+        .await
+        .expect("test account store must open")
+    }
+
+    fn test_tickets_runtime() -> crate::accounts::TicketStore {
+        crate::accounts::TicketStore::new().with_legacy_creation(true)
     }
 
     async fn send_bound_udp_request(

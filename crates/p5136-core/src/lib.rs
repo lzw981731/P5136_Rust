@@ -1,6 +1,7 @@
 //! P5136 wire-format primitives.
 
 pub mod adler32;
+pub mod auth_protocol;
 pub mod bml;
 pub mod captured_query_protocol;
 pub mod channel;

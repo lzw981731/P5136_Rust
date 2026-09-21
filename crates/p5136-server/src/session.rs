@@ -496,6 +496,9 @@ pub enum LoginSessionError {
     #[error("profile {nickname:?} does not exist and remote profile creation is disabled")]
     ProfileCreationDenied { nickname: String },
 
+    #[error("nickname {nickname:?} has no valid launcher login ticket")]
+    LoginTicketRequired { nickname: String },
+
     #[error("rider-school completion step must be 1..=42, received {step}")]
     InvalidRiderSchoolStep { step: u8 },
 
@@ -2298,6 +2301,7 @@ struct SessionServices<'a> {
     config: &'a ServerConfig,
     world: &'a WorldHandle,
     profiles: &'a ProfileCoordinator,
+    tickets: &'a crate::accounts::TicketStore,
     session_id: SessionId,
 }
 
@@ -2456,6 +2460,7 @@ pub(crate) async fn run_login_session(
     config: ServerConfig,
     world: WorldHandle,
     profiles: ProfileCoordinator,
+    tickets: crate::accounts::TicketStore,
     wire_operations: WireOperationGate,
 ) -> Result<(), LoginSessionError> {
     let (session_id, mut cancellation, mut outbound) = world
@@ -2470,6 +2475,7 @@ pub(crate) async fn run_login_session(
         config: &config,
         world: &world,
         profiles: &profiles,
+        tickets: &tickets,
         session_id,
     };
     let result = run_registered_session(
@@ -2823,6 +2829,7 @@ async fn dispatch_packet_admitted(
             services.config,
             services.world,
             services.profiles,
+            services.tickets,
             services.session_id,
             packet,
             context,
@@ -4011,18 +4018,45 @@ async fn handle_login(
     config: &ServerConfig,
     world: &WorldHandle,
     profiles: &ProfileCoordinator,
+    tickets: &crate::accounts::TicketStore,
     session_id: SessionId,
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let login = parse_pq_login(packet)?;
     let requested_pmap = login.requested_pmap;
+
+    // When account login is required, the launcher must have authenticated
+    // through the sidecar endpoint first and provisioned a ticket keyed by
+    // this exact rider nickname.  Consuming the ticket proves possession of
+    // the bound account; a missing ticket rejects the game login outright.
+    let granted_ticket = if config.require_account_login {
+        let nickname_key = crate::accounts::canonical_nickname_key(&login.nickname);
+        tickets.consume(&nickname_key)
+    } else {
+        None
+    };
+    if config.require_account_login && granted_ticket.is_none() {
+        return Err(LoginSessionError::LoginTicketRequired {
+            nickname: login.nickname,
+        });
+    }
+    if let Some(ticket) = &granted_ticket {
+        tracing::debug!(
+            username = ticket.username,
+            nickname = ticket.nickname,
+            "consumed launcher login ticket"
+        );
+    }
+
     let admission = profiles.admit(&login.nickname, "login profile").await?;
     let claimed = world.claim_identity(session_id, login.nickname).await?;
     let (profile, equipment, lane) = profiles
         .load_with_equipment_and_pmap(
             claimed.nickname.clone(),
-            config.allow_remote_profile_creation || claimed.source_ip.is_loopback(),
+            granted_ticket.is_some()
+                || config.allow_remote_profile_creation
+                || claimed.source_ip.is_loopback(),
             requested_pmap,
             admission,
         )
@@ -7140,6 +7174,10 @@ mod tests {
             .unwrap();
     }
 
+    fn test_tickets() -> crate::accounts::TicketStore {
+        crate::accounts::TicketStore::new().with_legacy_creation(true)
+    }
+
     async fn bind_test_profile(
         profiles: &ProfileCoordinator,
         identity: &IdentityBinding,
@@ -7184,6 +7222,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -7274,6 +7313,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8127,6 +8167,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = SessionContext::default();
@@ -8204,6 +8245,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8285,6 +8327,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8377,6 +8420,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8541,6 +8585,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
 
@@ -8623,6 +8668,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8667,6 +8713,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8732,6 +8779,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8807,6 +8855,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -8905,6 +8954,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -9070,6 +9120,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -9172,6 +9223,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -9268,6 +9320,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -9333,6 +9386,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
 
@@ -9440,6 +9494,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: source,
         };
         let request = exact_shop_buy_request(ShopBuyRequest::Normal);
@@ -9483,6 +9538,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: destination,
         };
         let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
@@ -9519,6 +9575,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let request = PacketWriter::named(LOCKED_ITEM_LIST_REQUEST_NAME).into_inner();
@@ -9605,6 +9662,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -9659,6 +9717,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let cases = [
@@ -9772,6 +9831,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: source,
         };
 
@@ -9825,6 +9885,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: destination,
         };
         let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
@@ -9881,6 +9942,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: source,
         };
         let request = exact_club_query_request(ClubQueryRequest::GetClubListCount);
@@ -9927,6 +9989,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: destination,
         };
         let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
@@ -9965,6 +10028,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
 
@@ -10075,6 +10139,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let request = captured_club_channel_switch_request();
@@ -10141,6 +10206,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let requests = [
@@ -10221,6 +10287,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -10337,6 +10404,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -10448,6 +10516,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let request = exact_get_rider_info_request("OfflineTarget", u8::MAX);
@@ -10607,6 +10676,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let request = exact_start_rider_school_request(0xA5);
@@ -10699,6 +10769,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: source,
         };
 
@@ -10758,6 +10829,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: destination,
         };
         let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
@@ -10805,6 +10877,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = bind_test_profile(&profiles, &identity).await;
@@ -11567,12 +11640,14 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: direct_owner_session,
         };
         let visitor_services = SessionServices {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: direct_visitor_session,
         };
 
@@ -11697,6 +11772,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
 
@@ -11802,6 +11878,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: second_session,
         };
         assert!(
@@ -11868,6 +11945,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner_session,
         };
         let mut self_enter = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
@@ -11942,6 +12020,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: outsider_session,
         };
 
@@ -12054,6 +12133,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
         let request = PacketWriter::named(REENTER_MYROOM_REQUEST_NAME).into_inner();
@@ -12108,6 +12188,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         let request = PacketWriter::named(REENTER_MYROOM_REQUEST_NAME).into_inner();
@@ -12169,6 +12250,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
         let request = PacketWriter::named(REENTER_MYROOM_REQUEST_NAME).into_inner();
@@ -12228,6 +12310,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
         let request = PacketWriter::named(ENTER_RANDOM_MYROOM_REQUEST_NAME).into_inner();
@@ -12288,6 +12371,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
         let request = PacketWriter::named(ENTER_RANDOM_MYROOM_REQUEST_NAME).into_inner();
@@ -12330,6 +12414,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
 
@@ -12420,6 +12505,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
 
@@ -12474,6 +12560,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: session,
         };
         let mut malformed = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
@@ -12525,6 +12612,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let outsider_services = SessionServices {
@@ -12650,6 +12738,7 @@ mod tests {
                 config: &config,
                 world: &world,
                 profiles: &profiles,
+                tickets: &test_tickets(),
                 session_id,
             };
             assert!(
@@ -12702,6 +12791,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
 
@@ -12723,6 +12813,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         assert!(
@@ -12826,6 +12917,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let mut secede = PacketWriter::named("ChRqSecedeMyRoomPacket").into_inner();
@@ -12876,6 +12968,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         let malformed_visitor_packet = PacketWriter::named("RmNotiMyRoomInfoPacket").into_inner();
@@ -12907,6 +13000,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: outsider_session,
         };
         assert!(
@@ -12952,12 +13046,14 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let visitor_services = SessionServices {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
 
@@ -13069,6 +13165,7 @@ mod tests {
                 config: &config,
                 world: &world,
                 profiles: &profiles,
+                tickets: &test_tickets(),
                 session_id,
             };
             assert!(
@@ -13111,6 +13208,7 @@ mod tests {
                 config: &config,
                 world: &world,
                 profiles: &profiles,
+                tickets: &test_tickets(),
                 session_id,
             };
             assert!(
@@ -13158,6 +13256,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         let career = PacketWriter::named(REQUEST_CAREER_LIST_NAME).into_inner();
@@ -13268,6 +13367,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
 
@@ -13395,6 +13495,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         assert!(
@@ -13413,6 +13514,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         assert!(
@@ -13462,6 +13564,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let visitor_services = SessionServices {
@@ -13549,6 +13652,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
 
@@ -13630,6 +13734,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let first = serialize_character_position(0, [1.0; 6]).unwrap();
@@ -13691,6 +13796,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let visitor_services = SessionServices {
@@ -13763,6 +13869,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let visitor_services = SessionServices {
@@ -13814,6 +13921,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
 
@@ -13914,6 +14022,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: outsider_session,
         };
         let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
@@ -13967,6 +14076,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
@@ -14027,6 +14137,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
@@ -14079,6 +14190,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: visitor.session,
         };
         let request_items = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
@@ -14145,6 +14257,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
@@ -14226,6 +14339,7 @@ mod tests {
                 config: &config,
                 world: &request_world,
                 profiles: &request_profiles,
+                tickets: &test_tickets(),
                 session_id: request_session,
             };
             dispatch_packet(&services, &request, &mut request_context).await
@@ -14313,6 +14427,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id: owner.session,
         };
         assert!(
@@ -14654,6 +14769,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = SessionContext::default();
@@ -14698,6 +14814,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = SessionContext::default();
@@ -14748,6 +14865,7 @@ mod tests {
             config: &config,
             world: &world,
             profiles: &profiles,
+            tickets: &test_tickets(),
             session_id,
         };
         let mut context = SessionContext::default();

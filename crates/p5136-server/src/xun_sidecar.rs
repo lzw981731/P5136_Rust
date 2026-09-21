@@ -7,6 +7,10 @@ use std::{
 };
 
 use p5136_core::{
+    auth_protocol::{
+        AUTH_HEADER_LENGTH, AUTH_MAGIC, AUTH_MAX_FRAME_BYTES, AuthOperation, AuthRequest,
+        AuthResponse, AuthStatus, decode_auth_request, encode_auth_response,
+    },
     dataraw_manifest::{
         DATARAW_PREFLIGHT_FRAME_LENGTH, DATARAW_PREFLIGHT_REQUEST_MAGIC, DataRawManifest,
         DataRawPreflightStatus, decode_dataraw_request, encode_dataraw_response,
@@ -30,8 +34,11 @@ use tokio::{
     time::timeout,
 };
 
+use crate::accounts::{AccountStore, TicketStore};
+
 const XUN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const XUN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTH_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 enum XunSidecarConnectionError {
@@ -68,6 +75,9 @@ struct XunSidecarRegistry {
 pub(crate) struct XunSidecarHandle {
     registry: Arc<Mutex<XunSidecarRegistry>>,
     data_raw_manifest: Option<DataRawManifest>,
+    accounts: Option<AccountStore>,
+    tickets: Option<TicketStore>,
+    registration_enabled: bool,
 }
 
 impl XunSidecarHandle {
@@ -75,7 +85,22 @@ impl XunSidecarHandle {
         Self {
             registry: Arc::new(Mutex::new(XunSidecarRegistry::default())),
             data_raw_manifest,
+            accounts: None,
+            tickets: None,
+            registration_enabled: false,
         }
+    }
+
+    pub(crate) fn with_accounts(
+        mut self,
+        accounts: AccountStore,
+        tickets: TicketStore,
+        registration_enabled: bool,
+    ) -> Self {
+        self.accounts = Some(accounts);
+        self.tickets = Some(tickets);
+        self.registration_enabled = registration_enabled;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, XunSidecarRegistry> {
@@ -157,6 +182,9 @@ impl XunSidecarHandle {
         if magic == DATARAW_PREFLIGHT_REQUEST_MAGIC {
             return self.serve_dataraw_preflight(stream, magic).await;
         }
+        if magic == AUTH_MAGIC {
+            return self.serve_auth_request(stream, magic).await;
+        }
         let mut header = [0_u8; XUN_SIDECAR_HANDSHAKE_HEADER_LENGTH];
         header[0..4].copy_from_slice(&magic);
         timeout(XUN_HANDSHAKE_TIMEOUT, stream.read_exact(&mut header[4..]))
@@ -237,6 +265,148 @@ impl XunSidecarHandle {
             "completed DataRaw file-list preflight"
         );
         Ok(())
+    }
+
+    /// Handles a single launcher authentication request (`P5XA` frame).
+    ///
+    /// The frame is a fixed request/response exchange: read the exact payload
+    /// length from the header, decode it, run the account operation, and write
+    /// back exactly one response frame.  When every credential is valid the
+    /// account's rider nickname is echoed back together with a login ticket so
+    /// the subsequent `PqLogin` session can be admitted.
+    async fn serve_auth_request(
+        &self,
+        stream: &mut TcpStream,
+        magic: [u8; 4],
+    ) -> Result<(), XunSidecarConnectionError> {
+        let mut header = [0_u8; AUTH_HEADER_LENGTH];
+        header[0..4].copy_from_slice(&magic);
+        timeout(AUTH_FRAME_TIMEOUT, stream.read_exact(&mut header[4..]))
+            .await
+            .map_err(|_| XunSidecarConnectionError::HandshakeTimeout)??;
+        let body_length = usize::from(u16::from_le_bytes([header[6], header[7]]));
+        if body_length > AUTH_MAX_FRAME_BYTES {
+            let response = encode_auth_response(&AuthResponse {
+                status: AuthStatus::InvalidRequest,
+                nickname: String::new(),
+                message: "auth frame too large".into(),
+            })
+            .expect("bounded auth response encodes");
+            timeout(XUN_WRITE_TIMEOUT, stream.write_all(&response))
+                .await
+                .map_err(|_| XunSidecarConnectionError::WriteTimeout)??;
+            return Ok(());
+        }
+        let mut body = vec![0_u8; body_length];
+        timeout(AUTH_FRAME_TIMEOUT, stream.read_exact(&mut body))
+            .await
+            .map_err(|_| XunSidecarConnectionError::HandshakeTimeout)??;
+        let mut frame = Vec::with_capacity(AUTH_HEADER_LENGTH + body_length);
+        frame.extend_from_slice(&magic);
+        frame.extend_from_slice(&header[4..8]);
+        frame.extend_from_slice(&body);
+
+        let response = match decode_auth_request(&frame).ok() {
+            None => AuthResponse {
+                status: AuthStatus::InvalidRequest,
+                nickname: String::new(),
+                message: "malformed auth frame".into(),
+            },
+            Some(request) => self.apply_auth_request(request).await,
+        };
+        let encoded = encode_auth_response(&response)
+            .expect("the bounded auth response always encodes");
+        timeout(XUN_WRITE_TIMEOUT, stream.write_all(&encoded))
+            .await
+            .map_err(|_| XunSidecarConnectionError::WriteTimeout)??;
+        tracing::info!(
+            status = ?response.status,
+            nickname = response.nickname,
+            "completed launcher authentication"
+        );
+        Ok(())
+    }
+
+    async fn apply_auth_request(&self, request: AuthRequest) -> AuthResponse {
+        let (Some(accounts), Some(tickets)) = (&self.accounts, &self.tickets) else {
+            return AuthResponse {
+                status: AuthStatus::InternalError,
+                nickname: String::new(),
+                message: "server account store is unavailable".into(),
+            };
+        };
+        match request.operation {
+            AuthOperation::Register => {
+                match accounts
+                    .register(
+                        &request.username,
+                        &request.password,
+                        &request.nickname,
+                        self.registration_enabled,
+                    )
+                    .await
+                {
+                    Ok(record) => {
+                        tickets.provision(&record.username, &record.nickname);
+                        tracing::info!(
+                            username = record.username,
+                            nickname = record.nickname,
+                            "registered launcher account"
+                        );
+                        AuthResponse {
+                            status: AuthStatus::Ok,
+                            nickname: record.nickname,
+                            message: "registered".into(),
+                        }
+                    }
+                    Err(error) => AuthResponse {
+                        status: account_error_status(&error),
+                        nickname: String::new(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+            AuthOperation::Login => {
+                match accounts
+                    .authenticate(&request.username, &request.password)
+                    .await
+                {
+                    Ok(account) => {
+                        tickets.provision(&account.username, &account.nickname);
+                        tracing::info!(
+                            username = account.username,
+                            nickname = account.nickname,
+                            "launcher login accepted"
+                        );
+                        AuthResponse {
+                            status: AuthStatus::Ok,
+                            nickname: account.nickname,
+                            message: "ok".into(),
+                        }
+                    }
+                    Err(error) => AuthResponse {
+                        status: account_error_status(&error),
+                        nickname: String::new(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn account_error_status(error: &crate::accounts::AccountError) -> AuthStatus {
+    use crate::accounts::AccountError;
+    match error {
+        AccountError::UsernameTaken => AuthStatus::AccountExists,
+        AccountError::NicknameTaken => AuthStatus::NicknameTaken,
+        AccountError::NicknameInvalid(_) => AuthStatus::NicknameInvalid,
+        AccountError::RegistrationDisabled => AuthStatus::RegistrationDisabled,
+        AccountError::InvalidCredentials => AuthStatus::AccountNotFound,
+        AccountError::UsernameInvalid(_) | AccountError::PasswordTooShort => {
+            AuthStatus::InvalidRequest
+        }
+        AccountError::Io(_) | AccountError::Json(_) => AuthStatus::InternalError,
     }
 }
 

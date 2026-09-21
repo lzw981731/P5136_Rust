@@ -49,6 +49,7 @@ pub struct ConnectorExecution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorStage {
+    Authenticating,
     PreparingInstallation,
     CheckingDataRaw,
     ProbingMessenger,
@@ -152,7 +153,18 @@ impl ConnectorPlan {
         })
     }
 
+    /// Replaces the rider nickname in a plan.
+    ///
+    /// A launcher that authenticates through the server first (account +
+    /// password) learns the account-bound nickname from the auth response and
+    /// must use exactly that name when preparing the client.  Everything else
+    /// about the plan stays identical.
     #[must_use]
+    pub fn with_nickname(mut self, nickname: String) -> Result<Self, ConnectorPlanError> {
+        self.nickname = normalize_nickname(&nickname)?;
+        Ok(self)
+    }
+
     pub fn prepared_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![
             self.game_directory.join("KartRider.pin"),

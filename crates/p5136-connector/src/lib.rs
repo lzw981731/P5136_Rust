@@ -1,6 +1,7 @@
 //! Testable connector primitives, independent of any GUI toolkit.
 
 mod bml;
+mod auth_client;
 mod codec_error;
 mod dataraw_preflight;
 mod detection;
@@ -20,6 +21,9 @@ mod wire;
 mod xml;
 
 pub use bml::BmlObject;
+pub use auth_client::{
+    LauncherAuthError, LauncherAuthMode, LauncherAuthOutcome, run_launcher_auth,
+};
 pub use codec_error::PinCodecError;
 pub use dataraw_preflight::{DataRawPreflightError, verify_dataraw_preflight};
 pub use detection::{

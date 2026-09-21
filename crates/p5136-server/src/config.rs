@@ -336,6 +336,13 @@ pub struct ServerConfig {
     /// Existing remote profiles can always log in. Keeping creation opt-in
     /// prevents unauthenticated nicknames from growing disk and cache state.
     pub allow_remote_profile_creation: bool,
+    /// Require a launcher login ticket for every `PqLogin`.  When enabled,
+    /// the connector must authenticate the account through the sidecar auth
+    /// endpoint before the game client may log in.
+    pub require_account_login: bool,
+    /// Permit self-service account registration over the sidecar auth
+    /// endpoint.  When disabled, existing accounts can still log in.
+    pub allow_registration: bool,
     pub max_login_payload: usize,
     pub max_messenger_payload: usize,
 }
@@ -364,6 +371,8 @@ impl Default for ServerConfig {
             session_write_timeout: Duration::from_secs(15),
             max_login_sessions: DEFAULT_MAX_LOGIN_SESSIONS,
             allow_remote_profile_creation: false,
+            require_account_login: false,
+            allow_registration: true,
             max_login_payload: DEFAULT_MAX_PAYLOAD,
             max_messenger_payload: 256 * 1024,
         }

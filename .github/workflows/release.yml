@@ -37,6 +37,13 @@ jobs:
           libxcb-xfixes0-dev
           libxkbcommon-dev
           libssl-dev
+          libgl1-mesa-dev
+          libx11-dev
+          libxcursor-dev
+          libxrandr-dev
+          libxi-dev
+          libwayland-dev
+          libxkbcommon-x11-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -48,7 +55,16 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
       - name: Build release binary
+        if: runner.os != 'Windows'
         run: cargo build -p p5136-cli --release --locked
+
+      - name: Build release binary (Windows static CRT)
+        if: runner.os == 'Windows'
+        run: cargo build -p p5136-cli --release --locked
+        env:
+          # Windows LTSC images ship without the VC++ runtime; statically link
+          # the CRT so the resulting exe runs on a clean system.
+          RUSTFLAGS: "-Dwarnings -C target-feature=+crt-static"
 
       - name: Build and test Win32 XUN sidecar
         if: runner.os == 'Windows'

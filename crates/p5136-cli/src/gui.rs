@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -53,7 +53,7 @@ const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const GUI_SETTINGS_KEY: &str = "p5136-gui-settings-v2";
 const MAX_GUI_SETTINGS_BYTES: usize = 2 * 1024 * 1024;
 
-pub(crate) fn run(logging: &LoggingRuntime) -> Result<()> {
+pub(crate) fn run(logging: &LoggingRuntime, launcher_only: bool) -> Result<()> {
     let log_path = logging.log_path.clone();
     let logging_control = logging.control.clone();
     let options = eframe::NativeOptions {
@@ -69,10 +69,11 @@ pub(crate) fn run(logging: &LoggingRuntime) -> Result<()> {
         options,
         Box::new(move |creation_context| {
             configure_platform_fonts(&creation_context.egui_ctx);
-            Ok(Box::new(P5136GuiApp::new_with_logging(
+            Ok(Box::new(P5136GuiApp::new_with_logging_mode(
                 log_path,
                 logging_control,
                 creation_context.storage,
+                launcher_only,
             )))
         }),
     )
@@ -206,6 +207,15 @@ struct GuiInputs {
     game_directory: String,
     game_executable: String,
     nickname: String,
+    /// Launcher account name (server-side launcher auth).
+    login_account: String,
+    /// Launcher password. Never persisted: `#[serde(skip)]` keeps it out of
+    /// the on-disk GUI settings so a shared machine cannot read it back.
+    #[serde(skip)]
+    login_password: String,
+    /// When registration mode is active the connector registers a new account
+    /// with `login_account` / `login_password` and binds `nickname`.
+    launcher_register_mode: bool,
     observer_mode: bool,
     anonymous_league_mode: bool,
     unlock_special_tracks: bool,
@@ -229,6 +239,9 @@ impl Default for GuiInputs {
             game_directory: default_game_directory().display().to_string(),
             game_executable: String::new(),
             nickname: "player".to_owned(),
+            login_account: String::new(),
+            login_password: String::new(),
+            launcher_register_mode: false,
             observer_mode: false,
             anonymous_league_mode: false,
             unlock_special_tracks: false,
@@ -388,6 +401,92 @@ impl GuiInputs {
                 )?,
             }),
         }
+    }
+
+    /// Builds the optional launcher auth request.
+    ///
+    /// When the account or password fields are empty the connector behaves
+    /// exactly as before (no launcher auth).  Otherwise it must authenticate
+    /// against the server sidecar endpoint; `register` mode additionally
+    /// requires the guest nickname so the account can bind a rider name.
+    fn launcher_auth_request(
+        &self,
+        language: GuiLanguage,
+    ) -> Result<Option<LauncherAuthRequest>> {
+        let account = self.login_account.trim();
+        let password = self.login_password.trim();
+        if account.is_empty() && password.is_empty() {
+            return Ok(None);
+        }
+        if account.is_empty() {
+            return Err(anyhow!(tr!(
+                language,
+                "로그인 계정을 입력하세요",
+                "Enter the account name",
+                "请输入账号"
+            )));
+        }
+        if password.is_empty() {
+            return Err(anyhow!(tr!(
+                language,
+                "로그인 비밀번호를 입력하세요",
+                "Enter the account password",
+                "请输入账号密码"
+            )));
+        }
+        let nickname = if self.launcher_register_mode {
+            let nickname = self.nickname.trim();
+            if nickname.is_empty() {
+                return Err(anyhow!(tr!(
+                    language,
+                    "등록 모드에서는 게임 닉네임을 입력하세요",
+                    "Enter a rider nickname to register an account",
+                    "注册模式请输入游戏昵称"
+                )));
+            }
+            nickname.to_owned()
+        } else {
+            String::new()
+        };
+        let server_address = self.server.trim().parse::<Ipv4Addr>().with_context(|| {
+            tr!(
+                language,
+                "서버 주소는 IPv4여야 합니다",
+                "The server address must be IPv4",
+                "服务器地址必须是 IPv4"
+            )
+        })?;
+        let configured_port = self
+            .configured_port
+            .trim()
+            .parse::<u16>()
+            .with_context(|| {
+                tr!(
+                    language,
+                    "기준 포트는 0~65535 범위여야 합니다",
+                    "The base port must be in the range 0–65535",
+                    "基准端口必须在 0–65535 范围内"
+                )
+            })?;
+        let sidecar_port = configured_port
+            .checked_add(3)
+            .ok_or_else(|| anyhow!(tr!(
+                language,
+                "기준 포트가 너무 커서 Sidecar 포트를 만들 수 없습니다",
+                "The base port is too large to derive the sidecar port",
+                "基准端口过大，无法推导 Sidecar 端口"
+            )))?;
+        Ok(Some(LauncherAuthRequest {
+            mode: if self.launcher_register_mode {
+                p5136_connector::LauncherAuthMode::Register
+            } else {
+                p5136_connector::LauncherAuthMode::Login
+            },
+            username: account.to_owned(),
+            password: password.to_owned(),
+            nickname,
+            sidecar_address: SocketAddr::new(IpAddr::V4(server_address), sidecar_port),
+        }))
     }
 }
 
@@ -1626,6 +1725,37 @@ impl XunAttachState {
     }
 }
 
+/// Authenticates the connector with the server before the game client starts.
+///
+/// This is the account gate for `--require-account-login` servers: the server
+/// answers the launcher auth exchange and provisions a one-shot login ticket;
+/// the game client's `PqLogin` is admitted only while that ticket is held.
+#[derive(Debug, Clone)]
+struct LauncherAuthRequest {
+    mode: p5136_connector::LauncherAuthMode,
+    username: String,
+    password: String,
+    nickname: String,
+    sidecar_address: SocketAddr,
+}
+
+impl LauncherAuthRequest {
+    fn run(&self, notifier: &GuiNotifier) -> Result<String, p5136_connector::LauncherAuthError> {
+        notifier.send(GuiEvent::Connector(ConnectorGuiEvent::Stage(
+            ConnectorStage::Authenticating,
+        )));
+        let outcome = p5136_connector::run_launcher_auth(
+            self.sidecar_address,
+            self.mode,
+            &self.username,
+            &self.password,
+            &self.nickname,
+            Duration::from_secs(5),
+        )?;
+        Ok(outcome.nickname)
+    }
+}
+
 enum ServerControl {
     GracefulShutdown,
     ForceShutdown,
@@ -1681,6 +1811,9 @@ struct P5136GuiApp {
     logging_control: FileLoggingControl,
     language: GuiLanguage,
     selected_tab: GuiTab,
+    /// Launcher-only mode hides every server/import tab and presents just the
+    /// account login + connector surface (a dedicated login tool).
+    launcher_only: bool,
     connector_inputs: GuiInputs,
     connector_run_state: GuiRunState,
     xun_attach_state: XunAttachState,
@@ -1729,14 +1862,20 @@ struct P5136GuiApp {
 impl P5136GuiApp {
     #[cfg(test)]
     fn new(log_path: PathBuf, storage: Option<&dyn eframe::Storage>) -> Self {
-        Self::new_with_logging(log_path, FileLoggingControl::default(), storage)
+        Self::new_with_logging_mode(
+            log_path,
+            FileLoggingControl::default(),
+            storage,
+            false,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
-    fn new_with_logging(
+    fn new_with_logging_mode(
         log_path: PathBuf,
         logging_control: FileLoggingControl,
         storage: Option<&dyn eframe::Storage>,
+        launcher_only: bool,
     ) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         let persisted = GuiPersistedSettings::load(storage);
@@ -1769,7 +1908,12 @@ impl P5136GuiApp {
             log_path,
             logging_control,
             language,
-            selected_tab: GuiTab::Server,
+            selected_tab: if launcher_only {
+                GuiTab::Connector
+            } else {
+                GuiTab::Server
+            },
+            launcher_only,
             connector_inputs,
             connector_run_state: GuiRunState::Idle,
             xun_attach_state: XunAttachState::Idle,
@@ -2101,6 +2245,13 @@ impl P5136GuiApp {
                 return;
             }
         };
+        let auth_request = match self.connector_inputs.launcher_auth_request(language) {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.connector_run_state = GuiRunState::Failed(format!("{error:#}"));
+                return;
+            }
+        };
         if !self.connector_run_state.begin() {
             return;
         }
@@ -2115,9 +2266,14 @@ impl P5136GuiApp {
         if let Err(error) = thread::Builder::new()
             .name("p5136-connector-worker".to_owned())
             .spawn(move || {
-                let outcome =
-                    run_connector_worker(&plan, &worker_notifier, &worker_cancellation, language)
-                        .map_err(|error| format!("{error:#}"));
+                let outcome = run_connector_worker(
+                    &plan,
+                    auth_request.as_ref(),
+                    &worker_notifier,
+                    &worker_cancellation,
+                    language,
+                )
+                .map_err(|error| format!("{error:#}"));
                 worker_notifier.send(GuiEvent::Connector(ConnectorGuiEvent::Finished(outcome)));
             })
         {
@@ -2512,6 +2668,66 @@ impl P5136GuiApp {
                     egui::TextEdit::singleline(&mut self.connector_inputs.nickname)
                         .desired_width(f32::INFINITY),
                 );
+                ui.end_row();
+
+                ui.label(tr!(
+                    language,
+                    "로그인 계정",
+                    "Account",
+                    "账号"
+                ));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.login_account)
+                        .hint_text(tr!(
+                            language,
+                            "서버에 등록한 계정",
+                            "Registered account name",
+                            "在服务器注册的账号"
+                        ))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label(tr!(
+                    language,
+                    "비밀번호",
+                    "Password",
+                    "密码"
+                ));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.login_password)
+                        .password(true)
+                        .hint_text(tr!(
+                            language,
+                            "계정 비밀번호",
+                            "Account password",
+                            "账号密码"
+                        ))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label(tr!(
+                    language,
+                    "계정 등록",
+                    "Register",
+                    "注册账号"
+                ));
+                ui.checkbox(
+                    &mut self.connector_inputs.launcher_register_mode,
+                    tr!(
+                        language,
+                        "새 계정 등록 및 닉네임 바인딩",
+                        "Register a new account and bind the nickname",
+                        "注册新账号并绑定昵称"
+                    ),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "켜면 위 닉네임을 새 계정에 바인딩합니다. 계정은 1~32자, 비밀번호는 6자 이상이어야 합니다.",
+                    "When enabled, the nickname above is bound to a new account. The account name must be 1–32 characters and the password at least 6 characters.",
+                    "启用后，将把上方昵称绑定到新账号。账号名需 1–32 个字符，密码至少 6 个字符。"
+                ));
                 ui.end_row();
 
                 ui.label(tr!(language, "계정 역할", "Account role", "账号角色"));
@@ -5746,73 +5962,87 @@ impl P5136GuiApp {
         let language = self.language;
         let running = self.connector_run_state.is_running();
         let attaching = self.xun_attach_state.is_running();
-        ui.heading(tr!(language, "접속기", "Connector", "连接器"));
-        ui.label(tr!(
-            language,
-            "정식 클라이언트 한 개를 준비하고 메신저 접속을 확인한 뒤 실행합니다.",
-            "Prepares one stock client, verifies messenger reachability, and launches it.",
-            "准备一个原版客户端，确认聊天服务器可连接后启动。"
-        ));
+        if self.launcher_only {
+            ui.heading(tr!(language, "로그인", "Login", "登录"));
+            ui.label(tr!(
+                language,
+                "계정으로 로그인하거나 새 계정을 등록한 뒤 클라이언트를 실행합니다. 미등록 계정은 게임 서버에 로그인할 수 없습니다.",
+                "Log in with an account (or register a new one) and launch the client. Game logins require a registered account.",
+                "使用账号登录（或注册新账号）后启动客户端。未注册的账号无法登录游戏服务器。"
+            ));
+        } else {
+            ui.heading(tr!(language, "접속기", "Connector", "连接器"));
+            ui.label(tr!(
+                language,
+                "정식 클라이언트 한 개를 준비하고 메신저 접속을 확인한 뒤 실행합니다.",
+                "Prepares one stock client, verifies messenger reachability, and launches it.",
+                "准备一个原版客户端，确认聊天服务器可连接后启动。"
+            ));
+        }
         ui.add_space(10.0);
         ui.add_enabled_ui(!running, |ui| self.connector_input_panel(ui));
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(10.0);
-        self.xun_attach_file_panel(ui);
-        ui.add_space(10.0);
+        if !self.launcher_only {
+            self.xun_attach_file_panel(ui);
+            ui.add_space(10.0);
+        }
 
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !running,
-                    egui::Button::new(tr!(
-                        language,
-                        "클라이언트 준비 및 실행",
-                        "Prepare and launch client",
-                        "准备并启动客户端"
-                    ))
+                    egui::Button::new(if self.launcher_only {
+                    tr!(language, "로그인 후 실행", "Log in and launch", "登录并启动")
+                } else {
+                    tr!(language, "클라이언트 준비 및 실행", "Prepare and launch client", "准备并启动客户端")
+                })
                     .min_size([180.0, 34.0].into()),
                 )
                 .clicked()
             {
                 self.start_connector(ui.ctx());
             }
-            if ui
-                .add_enabled(
-                    !running && !attaching,
-                    egui::Button::new(tr!(
+            if !self.launcher_only
+                && ui
+                    .add_enabled(
+                        !running && !attaching,
+                        egui::Button::new(tr!(
+                            language,
+                            "XUN DLL 연결",
+                            "Attach XUN DLL",
+                            "连接 XUN DLL"
+                        ))
+                        .min_size([150.0, 34.0].into()),
+                    )
+                    .on_hover_text(tr!(
                         language,
-                        "XUN DLL 연결",
-                        "Attach XUN DLL",
-                        "连接 XUN DLL"
+                        "실행 중인 클라이언트에 관리자 권한으로 XUN DLL을 연결합니다.",
+                        "Attaches the XUN DLL to the running client with administrator privileges.",
+                        "以管理员权限将 XUN DLL 连接到正在运行的客户端。"
                     ))
-                    .min_size([150.0, 34.0].into()),
-                )
-                .on_hover_text(tr!(
-                    language,
-                    "실행 중인 클라이언트에 관리자 권한으로 XUN DLL을 연결합니다.",
-                    "Attaches the XUN DLL to the running client with administrator privileges.",
-                    "以管理员权限将 XUN DLL 连接到正在运行的客户端。"
-                ))
-                .clicked()
+                    .clicked()
             {
                 self.start_xun_attach(ui.ctx());
             }
-            ui.checkbox(
-                &mut self.connector_inputs.xun_dll_logging,
-                tr!(
+            if !self.launcher_only {
+                ui.checkbox(
+                    &mut self.connector_inputs.xun_dll_logging,
+                    tr!(
+                        language,
+                        "DLL 로그 기록",
+                        "DLL logging",
+                        "DLL 日志记录"
+                    ),
+                )
+                .on_hover_text(tr!(
                     language,
-                    "DLL 로그 기록",
-                    "DLL logging",
-                    "DLL 日志记录"
-                ),
-            )
-            .on_hover_text(tr!(
-                language,
-                "끄면 XUN 기능은 유지하지만 p5136-xun-sidecar.log 파일을 기록하지 않습니다.",
-                "When disabled, XUN features remain active but p5136-xun-sidecar.log is not written.",
-                "关闭后仍启用 XUN 功能，但不会写入 p5136-xun-sidecar.log。"
-            ));
+                    "끄면 XUN 기능은 유지하지만 p5136-xun-sidecar.log 파일을 기록하지 않습니다.",
+                    "When disabled, XUN features remain active but p5136-xun-sidecar.log is not written.",
+                    "关闭后仍启用 XUN 功能，但不会写入 p5136-xun-sidecar.log。"
+                ));
+            }
         });
         ui.add_space(10.0);
         self.connector_status_panel(ui);
@@ -5920,40 +6150,53 @@ impl eframe::App for P5136GuiApp {
                 .to_owned()
             });
             ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.selected_tab,
-                    GuiTab::Server,
-                    tr!(language, "서버", "Server", "服务器"),
-                );
-                ui.selectable_value(
-                    &mut self.selected_tab,
-                    GuiTab::ServerManagement,
-                    tr!(language, "서버 관리", "Server management", "服务器管理"),
-                );
-                ui.selectable_value(
-                    &mut self.selected_tab,
-                    GuiTab::TrackImport,
-                    tr!(language, "트랙 가져오기", "Track import", "赛道导入"),
-                );
-                ui.selectable_value(
-                    &mut self.selected_tab,
-                    GuiTab::AssetImport,
-                    tr!(language, "자산 가져오기", "Asset import", "资源导入"),
-                );
-                ui.selectable_value(
-                    &mut self.selected_tab,
-                    GuiTab::Connector,
-                    tr!(language, "접속기", "Connector", "连接器"),
-                );
+                if self.launcher_only {
+                    ui.heading(tr!(
+                        language,
+                        "로그인",
+                        "Login",
+                        "登录"
+                    ));
+                } else {
+                    ui.selectable_value(
+                        &mut self.selected_tab,
+                        GuiTab::Server,
+                        tr!(language, "서버", "Server", "服务器"),
+                    );
+                    ui.selectable_value(
+                        &mut self.selected_tab,
+                        GuiTab::ServerManagement,
+                        tr!(language, "서버 관리", "Server management", "服务器管理"),
+                    );
+                    ui.selectable_value(
+                        &mut self.selected_tab,
+                        GuiTab::TrackImport,
+                        tr!(language, "트랙 가져오기", "Track import", "赛道导入"),
+                    );
+                    ui.selectable_value(
+                        &mut self.selected_tab,
+                        GuiTab::AssetImport,
+                        tr!(language, "자산 가져오기", "Asset import", "资源导入"),
+                    );
+                    ui.selectable_value(
+                        &mut self.selected_tab,
+                        GuiTab::Connector,
+                        tr!(language, "접속기", "Connector", "连接器"),
+                    );
+                }
             });
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| match self.selected_tab {
-                GuiTab::Server => self.server_tab(ui),
-                GuiTab::ServerManagement => self.server_management_tab(ui),
-                GuiTab::TrackImport => self.track_import_tab(ui),
-                GuiTab::AssetImport => self.asset_import_tab(ui),
-                GuiTab::Connector => self.connector_tab(ui),
-            });
+            if self.launcher_only {
+                self.connector_tab(ui);
+            } else {
+                egui::ScrollArea::vertical().show(ui, |ui| match self.selected_tab {
+                    GuiTab::Server => self.server_tab(ui),
+                    GuiTab::ServerManagement => self.server_management_tab(ui),
+                    GuiTab::TrackImport => self.track_import_tab(ui),
+                    GuiTab::AssetImport => self.asset_import_tab(ui),
+                    GuiTab::Connector => self.connector_tab(ui),
+                });
+            }
         });
     }
 }
@@ -6008,10 +6251,31 @@ impl GuiNotifier {
 
 fn run_connector_worker(
     plan: &ConnectorPlan,
+    auth: Option<&LauncherAuthRequest>,
     notifier: &GuiNotifier,
     cancellation: &ConnectorCancellation,
     language: GuiLanguage,
 ) -> Result<GuiSuccess> {
+    let authenticated_plan = if let Some(auth) = auth {
+        let nickname = auth.run(notifier).map_err(|error| {
+            anyhow!(tr_format!(
+                language,
+                "계정 인증에 실패했습니다: {error}",
+                "Account authentication failed: {error}",
+                "账号验证失败：{error}"
+            ))
+        })?;
+        plan.clone().with_nickname(nickname).with_context(|| {
+            tr!(
+                language,
+                "인증된 닉네임을 접속기 계획에 적용하지 못했습니다",
+                "Failed to apply the authenticated nickname to the connector plan",
+                "无法将已验证的昵称应用到连接器方案"
+            )
+        })?
+    } else {
+        plan.clone()
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6024,19 +6288,22 @@ fn run_connector_worker(
             )
         })?;
     runtime.block_on(async {
-        let mut execution =
-            execute_connector_with_progress_and_cancellation(plan, cancellation, |stage| {
+        let mut execution = execute_connector_with_progress_and_cancellation(
+            &authenticated_plan,
+            cancellation,
+            |stage| {
                 notifier.send(GuiEvent::Connector(ConnectorGuiEvent::Stage(stage)));
-            })
-            .await
-            .with_context(|| {
-                tr!(
-                    language,
-                    "접속기 실행에 실패했습니다",
-                    "Connector execution failed",
-                    "连接器执行失败"
-                )
-            })?;
+            },
+        )
+        .await
+        .with_context(|| {
+            tr!(
+                language,
+                "접속기 실행에 실패했습니다",
+                "Connector execution failed",
+                "连接器执行失败"
+            )
+        })?;
         let status = execution.launched_process.try_status().with_context(|| {
             tr!(
                 language,
@@ -6379,6 +6646,12 @@ fn run_xun_attach_elevated(
 
 fn stage_label(stage: ConnectorStage, language: GuiLanguage) -> &'static str {
     match stage {
+        ConnectorStage::Authenticating => tr!(
+            language,
+            "계정 인증(Sidecar)을 확인하는 중…",
+            "Authenticating the account with the server…",
+            "正在与服务器验证账号……"
+        ),
         ConnectorStage::PreparingInstallation => tr!(
             language,
             "PIN과 XML 파일을 준비하는 중…",
@@ -6457,6 +6730,9 @@ mod tests {
             game_directory: "/games/Kart Rider".to_owned(),
             game_executable: "/games/Kart Rider/KartRider.custom.exe".to_owned(),
             nickname: "fixture-user".to_owned(),
+            login_account: "fixture-account".to_owned(),
+            login_password: "fixture-password".to_owned(),
+            launcher_register_mode: false,
             observer_mode: true,
             anonymous_league_mode: false,
             unlock_special_tracks: true,
@@ -6800,7 +7076,14 @@ mod tests {
     fn gui_persists_server_and_connector_inputs_between_runs() {
         let mut app = P5136GuiApp::new(PathBuf::new(), None);
         app.language = GuiLanguage::SimplifiedChinese;
-        app.connector_inputs = fixture_inputs();
+        app.connector_inputs = {
+            let mut inputs = fixture_inputs();
+            // The launcher password must never survive a persist/restore
+            // round trip: `#[serde(skip)]` drops it on the way in.  The
+            // fixture starts with a non-empty password to prove the drop.
+            inputs.login_password = "hunter2!".to_owned();
+            inputs
+        };
         app.track_import_inputs = TrackImportInputs {
             source_data: "D:/OtherKartRider/Data".to_owned(),
             source_region: TrackSourceRegion::Korea,
@@ -6850,6 +7133,11 @@ mod tests {
         assert!(storage.0.contains_key(GUI_SETTINGS_KEY));
 
         let restored = P5136GuiApp::new(PathBuf::new(), Some(&storage));
+        // The launcher password is intentionally not persisted; restore must
+        // yield an empty password even though the in-memory value was set.
+        assert!(restored.connector_inputs.login_password.is_empty());
+        let mut expected_connector = expected_connector;
+        expected_connector.login_password.clear();
         assert_eq!(restored.connector_inputs, expected_connector);
         assert_eq!(restored.server_inputs, expected_server);
         assert_eq!(restored.track_import_inputs, expected_track_import);

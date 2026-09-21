@@ -114,6 +114,18 @@ struct ServerArgs {
     /// Allow non-loopback clients to create profiles for new nicknames.
     #[arg(long)]
     allow_remote_profile_creation: bool,
+
+    /// Require every game login to present a launcher auth ticket.  When
+    /// enabled the connector must authenticate (account + password) through
+    /// the sidecar endpoint before the stock client may log in.
+    #[arg(long)]
+    require_account_login: bool,
+
+    /// Permit self-service account registration through the sidecar auth
+    /// endpoint.  Existing accounts can always log in; this only gates new
+    /// registrations.  Defaults to on; use `--no-allow-register` to disable.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    allow_register: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -205,9 +217,10 @@ enum RunnerKind {
 }
 
 fn main() -> Result<()> {
-    if should_start_gui(std::env::args_os()) {
+    let (gui_mode, launcher_only) = pick_gui_mode(std::env::args_os());
+    if gui_mode {
         let logging = init_tracing(false)?;
-        return gui::run(&logging);
+        return gui::run(&logging, launcher_only);
     }
 
     let cli = Cli::parse();
@@ -219,8 +232,21 @@ fn main() -> Result<()> {
     runtime.block_on(run_cli(cli))
 }
 
-fn should_start_gui(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
-    arguments.into_iter().nth(1).is_none()
+/// Classifies the bare invocation into GUI versus CLI mode.
+///
+/// A fully bare invocation (`p5136`) starts the full GUI.  The single
+/// `--launcher-only` argument starts the dedicated login-tool GUI with every
+/// server/import tab hidden.  Any other first argument is a CLI command.
+fn pick_gui_mode(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> (bool, bool) {
+    let mut arguments = arguments.into_iter();
+    arguments.next(); // executable name
+    match arguments.next().as_deref().and_then(|argument| argument.to_str()) {
+        None => (true, false),
+        Some("--launcher-only") => (true, true),
+        _ => (false, false),
+    }
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
@@ -418,6 +444,8 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         session_write_timeout: Duration::from_secs(args.session_write_timeout_seconds),
         max_login_sessions: args.max_login_sessions,
         allow_remote_profile_creation: args.allow_remote_profile_creation,
+        require_account_login: args.require_account_login,
+        allow_registration: args.allow_register,
         ..ServerConfig::default()
     };
     let catalog_configured = config.client_data_dir.is_some();
@@ -700,15 +728,34 @@ mod tests {
 
     #[test]
     fn no_arguments_select_gui_and_any_argument_selects_cli() {
-        assert!(super::should_start_gui([OsString::from("p5136")]));
-        assert!(!super::should_start_gui([
+        assert!(super::pick_gui_mode([OsString::from("p5136")]).0);
+        assert!(!super::pick_gui_mode([
             OsString::from("p5136"),
             OsString::from("--help"),
-        ]));
-        assert!(!super::should_start_gui([
+        ])
+        .0);
+        assert!(!super::pick_gui_mode([
             OsString::from("p5136"),
             OsString::new(),
-        ]));
+        ])
+        .0);
+    }
+
+    #[test]
+    fn launcher_only_argument_selects_the_login_tool_gui() {
+        let (gui_mode, launcher_only) =
+            super::pick_gui_mode([OsString::from("p5136"), OsString::from("--launcher-only")]);
+        assert!(gui_mode);
+        assert!(launcher_only);
+        // The full GUI is still the bare-invocation default.
+        let (gui_mode, launcher_only) = super::pick_gui_mode([OsString::from("p5136")]);
+        assert!(gui_mode);
+        assert!(!launcher_only);
+        // Any other first argument remains a CLI command.
+        let (gui_mode, launcher_only) =
+            super::pick_gui_mode([OsString::from("p5136"), OsString::from("server")]);
+        assert!(!gui_mode);
+        assert!(!launcher_only);
     }
 
     #[test]
